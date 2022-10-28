@@ -54,12 +54,12 @@ def set_seed(args):
     else:
         logging.info('No GPU available, using the CPU instead.')
 
-def load_data(data_path):
+def load_data(data_path, eval=False):
     samples = list()
     with open(data_path, 'r', encoding='utf-8') as f:
         data = json.load(f)
         for d in data['data']:
-            if d["ambiguous_label"] == 1 and d["scene_ids"] not in error_image:
+            if not eval and d["ambiguous_label"] == 1 and d["scene_ids"] not in error_image:
                 samples.append(
                     simmc_data(
                         dialog_id = d["dialog_id"],
@@ -70,6 +70,18 @@ def load_data(data_path):
                         object_map = d["object_map"]
                     )
                 )
+            if eval:
+                if d["ambiguous_label"] == 1:
+                    samples.append(
+                        simmc_data(
+                            dialog_id = d["dialog_id"],
+                            turn_id = d["turn_id"],
+                            input_text = d["input_text"],
+                            scene_ids = d["scene_ids"],
+                            candidates = None,
+                            object_map = d["object_map"]
+                        )
+                    )
 
     return samples
 

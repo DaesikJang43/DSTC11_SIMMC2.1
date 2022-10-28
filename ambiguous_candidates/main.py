@@ -4,7 +4,8 @@ import argparse
 
 from datetime import datetime
 from re import I
-from transformers import BertTokenizer, AdamW, get_linear_schedule_with_warmup, get_constant_schedule_with_warmup, BertConfig, BertForSequenceClassification
+from transformers import BertTokenizer, AdamW, get_linear_schedule_with_warmup, get_constant_schedule_with_warmup
+
 from torch.utils.data import DataLoader, TensorDataset
 from torch.utils.tensorboard import SummaryWriter
 
@@ -21,9 +22,8 @@ def train(args, train_dataset_1, train_dataset_2, dev_dataset, dev_source_data, 
     tr_sampler_2 = RandomSampler(train_dataset_2)
     tr_loader_2 = DataLoader(train_dataset_2, batch_size=args.train_batch_size, sampler=tr_sampler_2)
 
-    batch_nums = {str(task): len(loader) for task, loader in enumerate([tr_loader_1, tr_loader_2], start=1)}
-    task_total_batch_num = sum([batch_nums[k] for k in batch_nums])
-    order = order_selection([task for task in ["1", "2"]], batch_nums)
+    batch_nums = {str(task): len(loader) for task, loader in enumerate([tr_loader_1, tr_loader_2], start=1) if str(task) in args.task}
+    task_total_batch_num = sum([batch_nums[task] for task in batch_nums])
     
     t_total = task_total_batch_num // args.gradient_accumulation_steps * args.num_train_epochs
 
@@ -42,7 +42,7 @@ def train(args, train_dataset_1, train_dataset_2, dev_dataset, dev_source_data, 
     )
 
     logging.info("***** Running training *****")
-    logging.info("  Num examples = %d", len(train_dataset_1) + len(train_dataset_2))
+    logging.info("  Num examples = %d", sum([len(dataset) for task, dataset in enumerate([train_dataset_1, train_dataset_2], start=1) if str(task) in args.task]))
     logging.info("  Num Epochs = %d", args.num_train_epochs)
     logging.info(
         "  Total train batch size (w. parallel, accumulation) = %d",
@@ -64,9 +64,9 @@ def train(args, train_dataset_1, train_dataset_2, dev_dataset, dev_source_data, 
     eval_metrics = eval(args, dev_dataset, dev_source_data, model)
     for epoch in trange(int(args.num_train_epochs), desc="Epoch..."):
         model.train()
-        batch_nums = {str(task): len(loader) for task, loader in enumerate([tr_loader_1, tr_loader_2], start=1)}
-        order = order_selection([task for task in ["1", "2"]], batch_nums)
-        task_iterators = {task: iter(loader) for task, loader in [("1", tr_loader_1), ("2", tr_loader_2)]}
+        batch_nums = {str(task): len(loader) for task, loader in enumerate([tr_loader_1, tr_loader_2], start=1) if str(task) in args.task}
+        order = order_selection([task for task in args.task], batch_nums)
+        task_iterators = {str(task): iter(loader) for task, loader in enumerate([tr_loader_1, tr_loader_2], start=1) if str(task) in args.task}
         tr_loss = {task: .0 for task in task_iterators}
         nb_tr_examples = {task: 0 for task in task_iterators}
         for step, (cur_batch_task, index) in enumerate(tqdm(order, desc="Iteration over multi-tasks")):
@@ -84,7 +84,7 @@ def train(args, train_dataset_1, train_dataset_2, dev_dataset, dev_source_data, 
                     "obj_input_ids": batch[7],
                     "obj_attention_mask": batch[8],
                     "obj_token_type_ids": batch[9],
-                    "task": "1"
+                    "task": cur_batch_task
                 }
             elif cur_batch_task == "2":
                 inputs = {
@@ -98,7 +98,7 @@ def train(args, train_dataset_1, train_dataset_2, dev_dataset, dev_source_data, 
                     "obj_input_ids": batch[7],
                     "obj_attention_mask": batch[8],
                     "obj_token_type_ids": batch[9],
-                    "task": "2"
+                    "task": cur_batch_task
                 }
             else:
                 raise TypeError
@@ -144,10 +144,9 @@ def train(args, train_dataset_1, train_dataset_2, dev_dataset, dev_source_data, 
                 best_f1 = eval_metrics['f1']
                 best_precision = eval_metrics['precision']
                 best_recall = eval_metrics['recall']
-                best_f1_epoch = epoch + 1                
+                best_f1_epoch = epoch + 1
 
     logging.info('********** Train Result **********')
-    # logging.info(" Global step = {}, Average loss = {:.6f}".format(global_step, tr_loss / global_step))
     logging.info(" Best F1. = {} / {}".format(best_f1, best_f1_epoch))
     logging.info(" Best Precision. = {} / {}".format(best_precision, best_f1_epoch))
     logging.info(" Best Recall. = {} / {}".format(best_recall, best_f1_epoch))
@@ -192,15 +191,15 @@ def eval(args, eval_dataset, source_data, model, submission=False):
                     "disambiguation_candidates": [batch[7][0, p].cpu().item() for p in pred_list]
                 }
             )
-    results = [
-        {
-            "dialog_id": dialog_id,
-            "predictions": predictions,
-        }
-        for dialog_id, predictions in preds.items()
-    ]
 
     if not submission:
+        results = [
+            {
+                "dialog_id": dialog_id,
+                "predictions": predictions,
+            }
+            for dialog_id, predictions in preds.items()
+        ]
         eval_metrics = evaluate_ambiguous_candidates(source_data, results)
     
         logging.info('********** Eval Result **********')
@@ -208,6 +207,24 @@ def eval(args, eval_dataset, source_data, model, submission=False):
             logging.info("{}: {:.4f}".format(k, v))
         return eval_metrics
     else:
+        results = list()
+        ambiguous_label = defaultdict(list)
+        for d in source_data['data']:
+            if d["ambiguous_label"] == 0:
+                ambiguous_label[d["dialog_id"]].append(
+                    {
+                        "turn_id": d["turn_id"],
+                        "disambiguation_candidates": [],
+                    }
+                )
+        for dialog_id in ambiguous_label:
+            results.append(
+                {
+                    "dialog_id": dialog_id,
+                    "predictions": sorted(ambiguous_label[dialog_id] + preds[dialog_id], key=lambda x: x['turn_id']),
+                }
+            )
+
         return results
 
 
@@ -278,7 +295,7 @@ def main():
     )
     parser.add_argument(
         "--learning_rate",
-        default=1e-5,
+        default=5e-5,
         type=float,
         help="The initial learning rate for Adam."
     )
@@ -286,7 +303,7 @@ def main():
         "--gradient_accumulation_steps",
         default=1,
         type=int,
-        help=""
+        help="Gradient accumulation steps size"
     )
     parser.add_argument(
         "--weight_decay",
@@ -320,51 +337,51 @@ def main():
     )
     parser.add_argument(
         "--negative_sample_size",
-        default=5,
+        default=10,
         type=int,
-        help=""
+        help="Contrastive Loss negative sample size"
     )
     parser.add_argument(
         "--submission",
         action="store_true",
-        help=""
+        help="Whether to run submission mode"
     )
     parser.add_argument(
         "--positive_weight",
-        default=10.0,
+        default=3.0,
         type=float,
-        help=""
-    )
-    parser.add_argument(
-        "--loss_ratio",
-        default=0.5,
-        type=float,
-        help=""
+        help="BCEWithLogitsLoss positive weight"
     )
     parser.add_argument(
         "--temperature",
         default=1.0,
         type=float,
-        help=""
+        help="Contrastive Loss temperature"
+    )
+    parser.add_argument(
+        "--task",
+        default="12",
+        type=str,
+        help="1: ContrastiveLoss, 2: BCEWithLogitsLoss,"
     )
     args = parser.parse_args()
+    args.task = list(args.task)
 
     # GPU device setting 
     args.device = torch.device('cuda' if torch.cuda.is_available() and not args.no_cuda else 'cpu')
     args.n_gpu = torch.cuda.device_count() if torch.cuda.is_available() and not args.no_cuda else 0
 
     args.now = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    if not os.path.exists(os.path.join(args.output_dir, args.now)):
+    if args.do_train and not os.path.exists(os.path.join(args.output_dir, args.now)):
         os.makedirs(os.path.join(args.output_dir, args.now))
         args.output_dir = os.path.join(args.output_dir, args.now)
-        
 
     logging.basicConfig(
         format='%(asctime)s - %(levelname)s - %(message)s',
         level=logging.INFO,
         datefmt='%Y-%m-%d %H:%M:%S',
-        filename='{}/log.log'.format(args.output_dir), # , args.now.replace(':', '-')
-        filemode='w'
+        filename='{}/log.log'.format(args.output_dir) if not os.path.exists(os.path.join(args.output_dir, 'log.log')) else '{}/log_2.log'.format(args.output_dir),
+        filemode='a'
     )
     console = logging.StreamHandler()
     console.setLevel(logging.INFO)
@@ -383,14 +400,12 @@ def main():
     model.bert.resize_token_embeddings(len(tokenizer))
     model.to(args.device)
 
-
     if args.do_train:
         if os.path.exists(os.path.join("./data_cache", "train_features_1.bin")):
             train_features_1 = torch.load(os.path.join("./data_cache", "train_features_1.bin"))
         else:
             train_samples = load_data(os.path.join(args.data_dir, "simmc2.1_ambiguous_candidates_dstc11_train.json"))
             train_features_1 = convert_samples_to_features(args, train_samples, tokenizer, task="1")
-            # with open(os.path.join("./data_cache", "train_features.bin"), 'w') as f:
             torch.save(train_features_1, os.path.join("./data_cache", "train_features_1.bin"))
 
         if os.path.exists(os.path.join("./data_cache", "train_features_2.bin")):
@@ -398,7 +413,6 @@ def main():
         else:
             train_samples = load_data(os.path.join(args.data_dir, "simmc2.1_ambiguous_candidates_dstc11_train.json"))
             train_features_2 = convert_samples_to_features(args, train_samples, tokenizer, task="2")
-            # with open(os.path.join("./data_cache", "train_features.bin"), 'w') as f:
             torch.save(train_features_2, os.path.join("./data_cache", "train_features_2.bin"))
 
         if os.path.exists(os.path.join("./data_cache", "dev_features.bin")):
@@ -410,66 +424,85 @@ def main():
 
         with open(os.path.join(args.data_dir, "simmc2.1_dials_dstc11_dev.json"), 'r', encoding='utf-8') as f:
             dev_source_data = json.load(f)
-        
-        obj_embed = None
-        scene_embed = None
-        if os.path.exists(os.path.join(args.data_dir, "obj_image_public_v2.bin")):
-            obj_embed = torch.load(os.path.join(args.data_dir, "obj_image_public_v2.bin"))
-        if os.path.exists(os.path.join(args.data_dir, "scene_image_public_v2.bin")):
-            scene_embed = torch.load(os.path.join(args.data_dir, "scene_image_public_v2.bin"))
-        if os.path.exists(os.path.join(args.data_dir, "obj_image_public_normalized_bbox.bin")):
-            obj_bbox = torch.load(os.path.join(args.data_dir, "obj_image_public_normalized_bbox.bin"))
-        if os.path.exists(os.path.join(args.data_dir, "obj_text_feature.bin")):
-            obj_text = torch.load(os.path.join(args.data_dir, "obj_text_feature.bin"))
+
+        if os.path.exists(os.path.join(args.data_dir, "image_features", "obj_image_train.bin")):
+            obj_embed = torch.load(os.path.join(args.data_dir, "image_features", "obj_image_train.bin"))
+        else:
+            raise ValueError('Check your obj_image_train.bin file')
+        if os.path.exists(os.path.join(args.data_dir, "image_features", "scene_image_train.bin")):
+            scene_embed = torch.load(os.path.join(args.data_dir, "image_features", "scene_image_train.bin"))
+        else:
+            raise ValueError('Check your scene_image_train.bin file')
+        if os.path.exists(os.path.join(args.data_dir, "image_features", "obj_image_train_normalized_bbox.bin")):
+            obj_bbox = torch.load(os.path.join(args.data_dir, "image_features", "obj_image_train_normalized_bbox.bin"))
+        else:
+            raise ValueError('Check your obj_image_train_normalized_bbox.bin file')
+        if os.path.exists(os.path.join(args.data_dir, "image_features", "obj_text_feature_train.bin")):
+            obj_text = torch.load(os.path.join(args.data_dir, "image_features", "obj_text_feature_train.bin"))
+        else:
+            raise ValueError('Check your obj_text_feature_train.bin file')
 
         train_dataset_1 = TrainDataset_1(args, train_features_1, obj_embed, scene_embed, obj_bbox, obj_text)
         train_dataset_2 = TrainDataset_2(args, train_features_2, obj_embed, scene_embed, obj_bbox, obj_text)
-        dev_dataset = TestDataset(args, dev_features, obj_embed, scene_embed, obj_bbox, obj_text)
+        dev_dataset = TestDataset(args, dev_features, 'dev')
 
         train(args, train_dataset_1, train_dataset_2, dev_dataset, dev_source_data, model)
 
     if args.do_eval:
         model = Disambiguation_Detection(args)
         model.bert.resize_token_embeddings(len(tokenizer))
-        model.load_state_dict(torch.load(os.path.join(args.output_dir, "pytorch_model.bin")))
+        model.load_state_dict(torch.load(os.path.join(args.output_dir, "pytorch_model.bin")), strict=False)
         
-        obj_embed = None
-        scene_embed = None
         if not args.submission:
             if os.path.exists(os.path.join("./data_cache", "devtest_features.bin")):
                 dev_features = torch.load(os.path.join("./data_cache", "devtest_features.bin"))
             else:
                 devtest_samples = load_data(os.path.join(args.data_dir, "simmc2.1_ambiguous_candidates_dstc11_devtest.json"))
                 dev_features = convert_samples_to_features(args, devtest_samples, tokenizer, eval=True)
-                # with open(os.path.join("./data_cache", "devtest_features.bin"), 'w') as f:
                 torch.save(dev_features, os.path.join("./data_cache", "devtest_features.bin"))
             with open(os.path.join(args.data_dir, "simmc2.1_dials_dstc11_devtest.json"), 'r', encoding='utf-8') as f:
                 dev_source_data = json.load(f)
-        
-            if os.path.exists(os.path.join(args.data_dir, "obj_image_public_v2.bin")):
-                obj_embed = torch.load(os.path.join(args.data_dir, "obj_image_public_v2.bin"))
-            if os.path.exists(os.path.join(args.data_dir, "scene_image_public_v2.bin")):
-                scene_embed = torch.load(os.path.join(args.data_dir, "scene_image_public_v2.bin"))
-            if os.path.exists(os.path.join(args.data_dir, "obj_image_public_normalized_bbox.bin")):
-                obj_bbox = torch.load(os.path.join(args.data_dir, "obj_image_public_normalized_bbox.bin"))
-            if os.path.exists(os.path.join(args.data_dir, "obj_text_feature.bin")):
-                obj_text = torch.load(os.path.join(args.data_dir, "obj_text_feature.bin"))
                 
-            devtest_dataset = TestDataset(args, dev_features, obj_embed, scene_embed, obj_bbox, obj_text)
+            devtest_dataset = TestDataset(args, dev_features, 'devtest')
             eval_metrics = eval(args, devtest_dataset, dev_source_data, model)
         else:
-            if os.path.exists(os.path.join("./data_cache", "teststd_public_features.bin")):
-                teststd_public_features = torch.load(os.path.join("./data_cache", "teststd_public_features.bin"))
+            if os.path.exists(os.path.join("./data_cache", "teststd_features.bin")):
+                teststd_features = torch.load(os.path.join("./data_cache", "teststd_features.bin"))
             else:
-                teststd_public_samples = load_data(os.path.join(args.data_dir, "simmc2.1_ambiguous_candidates_dstc11_teststd_public.json"))
-                teststd_public_features = convert_samples_to_features(args, teststd_public_samples, tokenizer)
-                # with open(os.path.join("./data_cache", "teststd_public_features.bin"), 'w') as f:
-                torch.save(teststd_public_features, os.path.join("./data_cache", "teststd_public_features.bin"))
-            with open(os.path.join(args.data_dir, "simmc2.1_dials_dstc11_teststd_public.json"), 'r', encoding='utf-8') as f:
-                teststd_public_source_data = json.load(f)
+                teststd_samples = load_data(os.path.join(args.data_dir, "simmc2.1_ambiguous_candidates_dstc11_teststd_prediction.json"), eval=True)
+                teststd_features = convert_samples_to_features(args, teststd_samples, tokenizer)
+                torch.save(teststd_features, os.path.join("./data_cache", "teststd_features.bin"))
+            with open(os.path.join(args.data_dir, "simmc2.1_ambiguous_candidates_dstc11_teststd_prediction.json"), 'r', encoding='utf-8') as f:
+                teststd_source_data = json.load(f)
             
-            teststd_public_dataset = TestDataset(args, teststd_public_features, obj_embed, scene_embed, obj_bbox, obj_text)
-            predictions = eval(args, teststd_public_dataset, teststd_public_source_data, model, submission=True)
+            teststd_dataset = TestDataset(args, teststd_features, 'teststd')
+            predictions = eval(args, teststd_dataset, teststd_source_data, model, submission=True)
+
+            with open(os.path.join(args.data_dir, "simmc2.1_dials_dstc11_teststd_public.json"), 'r', encoding='utf-8') as f:
+                teststd_data = json.load(f)
+
+            predicted_teststd = {"dialogue_data": list()}
+            for dialog, preds in zip(teststd_data["dialogue_data"], predictions):
+                predicted_dialogue = {"dialogue": list()}
+                for turn_data, pred in zip(dialog['dialogue'], preds['predictions']):
+                    turn_data["transcript_annotated"] = {
+                        "act": "",
+                        "act_attributes": {
+                            "slot_values": dict(),
+                            "request_slots": list(),
+                            "objects": list()
+                        },
+                        "disambiguation_candidates": pred["disambiguation_candidates"]
+                    }
+                    predicted_dialogue["dialogue"].append(turn_data)
+                for key in dialog.keys():
+                    if key != "dialogue_data":
+                        predicted_dialogue[key] = dialog[key]
+
+                predicted_teststd["dialogue_data"].append(predicted_dialogue)
+
+            with open(os.path.join(args.output_dir, 'dstc11-simmc-teststd-pred-subtask-123.json'), 'w', encoding='utf-8') as f:
+                json.dump(predicted_teststd, f, indent='\t')
     
 if __name__ == "__main__":
     main()
