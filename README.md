@@ -220,6 +220,7 @@ python main.py \
 The final prediction files that we submitted are located in the path below. These are the final prediction results intended to be compared to those of other models
 
 ```sh
+# Sub-task 1
 ambiguous_candidates/outputs/dstc11-simmc-teststd-pred-subtask-123.json
 ```
 
