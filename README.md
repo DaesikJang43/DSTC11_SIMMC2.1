@@ -102,7 +102,7 @@ python ImageClassification_preprocess.py \
 python main.py \
 	--do_train \
 	--do_eval \
-	--data_dir ../data/image_classification  \
+	--data_dir ../data  \
 	--task 1234 \
 	--learning_rate 9e-5 \
 	--num_train_epochs 10 \
